@@ -79,9 +79,8 @@ def homogeneity(labels1, labels2):
     return num_missed / 2.0
 
 
-
 def test_hdbscan_feature_vector():
-    labels, p, ltree, ctree, mtree = fast_hdbscan(X, return_trees=True)
+    labels, p, ltree, ctree, mtree, neighbors = fast_hdbscan(X, return_trees=True)
     n_clusters_1 = len(set(labels)) - int(-1 in labels)
     assert n_clusters_1 == n_clusters
 
@@ -89,11 +88,13 @@ def test_hdbscan_feature_vector():
     n_clusters_2 = len(set(labels)) - int(-1 in labels)
     assert n_clusters_2 == n_clusters
 
+
 def test_hdbscan_dbscan_clustering():
     clusterer = HDBSCAN().fit(X)
     labels = clusterer.dbscan_clustering(0.3)
     n_clusters_1 = len(set(labels)) - int(-1 in labels)
     assert(n_clusters == n_clusters_1)
+
 
 def test_hdbscan_no_clusters():
     labels, p= fast_hdbscan(X, min_cluster_size=len(X) + 1)
@@ -103,6 +104,7 @@ def test_hdbscan_no_clusters():
     labels = HDBSCAN(min_cluster_size=len(X) + 1).fit(X).labels_
     n_clusters_2 = len(set(labels)) - int(-1 in labels)
     assert n_clusters_2 == 0
+
 
 def test_hdbscan_sample_weight():
     sample_weight = y.astype(np.float32)
@@ -149,6 +151,12 @@ def test_hdbscan_badargs():
     with pytest.raises(ValueError): 
         fast_hdbscan(X, cluster_selection_epsilon=-0.1)
     with pytest.raises(ValueError): 
+        fast_hdbscan(X, cluster_selection_persistence="fail")
+    with pytest.raises(ValueError): 
+        fast_hdbscan(X, cluster_selection_persistence=1)
+    with pytest.raises(ValueError): 
+        fast_hdbscan(X, cluster_selection_persistence=-0.1)
+    with pytest.raises(ValueError): 
         fast_hdbscan(X, cluster_selection_method="fail")
     with pytest.raises(ValueError): 
         fast_hdbscan(X, semi_supervised=True, ss_algorithm="fail")
@@ -184,6 +192,15 @@ def test_hdbscan_max_cluster_size():
     for label in set(model.labels_):
         if label != -1:
             assert np.sum(model.labels_ == label) <= 30
+
+
+def test_hdbscan_persistence_threshold():
+    model = HDBSCAN(
+        min_cluster_size=5,
+        cluster_selection_method="leaf",
+        cluster_selection_persistence=20.0,
+    ).fit(X)
+    assert np.all(model.labels_ == -1)
 
 
 def test_mst_entry():
