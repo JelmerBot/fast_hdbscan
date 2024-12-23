@@ -4,8 +4,11 @@ Test for the branches module.
 
 import pytest
 import numpy as np
+from numba import set_num_threads
 from sklearn.exceptions import NotFittedError
 from fast_hdbscan import HDBSCAN, BranchDetector, detect_branches_in_clusters
+
+set_num_threads(1)
 
 
 def make_branches(points_per_branch=30):
@@ -42,11 +45,9 @@ c = HDBSCAN(min_samples=5, min_cluster_size=10).fit(X)
 
 def check_detected_groups(c, n_clusters=3, n_branches=6, overridden=False):
     """Checks branch_detector output for main invariants."""
-    assert len(np.unique(c.labels_)) - int(-1 in c.labels_) == n_branches
-    assert (
-        len(np.unique(c.cluster_labels_)) - int(-1 in c.cluster_labels_) == n_clusters
-    )
     noise_mask = c.labels_ == -1
+    assert np.all(np.unique(c.labels_[~noise_mask]) == np.arange(n_branches))
+    assert np.all(np.unique(c.cluster_labels_[~noise_mask]) == np.arange(n_clusters))
     assert (c.branch_labels_[noise_mask] == 0).all()
     assert (c.branch_probabilities_[noise_mask] == 1.0).all()
     assert (c.probabilities_[noise_mask] == 0.0).all()
@@ -59,18 +60,21 @@ def check_detected_groups(c, n_clusters=3, n_branches=6, overridden=False):
 
 
 def test_attributes():
+    def check_attributes():
+        b = BranchDetector().fit(c)
+        check_detected_groups(b, n_clusters=2, n_branches=5)
+        assert len(b.linkage_trees_) == 2
+        assert len(b.condensed_trees_) == 2
+        assert isinstance(b.condensed_trees_[0], CondensedTree)
+        assert isinstance(b.linkage_trees_[0], SingleLinkageTree)
+        assert isinstance(b.approximation_graph_, ApproximationGraph)
+
     try:
         from hdbscan.plots import ApproximationGraph, CondensedTree, SingleLinkageTree
+
+        check_attributes()
     except ImportError:
         pass
-
-    b = BranchDetector().fit(c)
-    check_detected_groups(b, n_clusters=2, n_branches=5)
-    assert len(b.linkage_trees_) == 2
-    assert len(b.condensed_trees_) == 2
-    assert isinstance(b.condensed_trees_[0], CondensedTree)
-    assert isinstance(b.linkage_trees_[0], SingleLinkageTree)
-    assert isinstance(b.approximation_graph_, ApproximationGraph)
 
 
 def test_selection_method():
@@ -124,7 +128,7 @@ def test_allow_single_branch_with_filters():
     b = BranchDetector(
         min_branch_size=5,
         branch_selection_method="leaf",
-        branch_selection_persistence=0.1,
+        branch_selection_persistence=0.15,
     ).fit(c)
     unique_labels = np.unique(b.labels_)
     assert len(unique_labels) == 2
@@ -133,7 +137,7 @@ def test_allow_single_branch_with_filters():
     b = BranchDetector(
         min_branch_size=5,
         branch_selection_method="leaf",
-        branch_selection_epsilon=1 / 0.002
+        branch_selection_epsilon=1 / 0.002,
     ).fit(c)
     unique_labels = np.unique(b.labels_)
     assert len(unique_labels) == 2

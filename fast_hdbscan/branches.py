@@ -3,159 +3,103 @@ import numpy as np
 from sklearn.utils.validation import check_is_fitted
 from sklearn.base import BaseEstimator, ClusterMixin
 
-from scipy.sparse import coo_array
-from scipy.sparse.csgraph import minimum_spanning_tree, connected_components
-
-from .cluster_trees import empty_condensed_tree
-from .hdbscan import fast_hdbscan_mst_edges, to_numpy_rec_array
+from .hdbscan import to_numpy_rec_array
+from .core_graph import core_graph_clusters
 
 try:
-    from hdbscan.plots import CondensedTree, SingleLinkageTree, ApproximationGraph
+    from hdbscan.plots import (
+        CondensedTree,
+        SingleLinkageTree,
+        ApproximationGraph,
+        MinimumSpanningTree,
+    )
 except ImportError:
     pass
 
 
-def extract_core_graph(
-    data,
-    neighbors,
-    min_spanning_tree,
-    cluster_probabilities,
-    points,
-):
-    # allocate space for the graph
-    num_points = len(points)
-    num_mst = min_spanning_tree.shape[0]
-    num_neighbors = neighbors.shape[1]
-    allocation_size = num_mst + num_points * num_neighbors
-    edges = np.zeros((allocation_size, 2), dtype=np.int32)
-    distances = np.empty(allocation_size, dtype=np.float32)
-
-    # build index to in-cluster id map
-    in_cluster_ids = np.full(data.shape[0], -1, dtype=np.intp)
-    in_cluster_ids[points] = np.arange(len(points), dtype=np.intp)
-
-    # fill mst edges
-    mst_parents = in_cluster_ids[min_spanning_tree[:, 0].astype(np.int32)]
-    mst_children = in_cluster_ids[min_spanning_tree[:, 1].astype(np.int32)]
-    np.minimum(mst_parents, mst_children, edges[:num_mst, 0])
-    np.maximum(mst_parents, mst_children, edges[:num_mst, 1])
-    distances[:num_mst] = min_spanning_tree[:, 2]
-
-    # fill neighbor edges
-    cluster_data = data[points, :]
-    core_parent = np.repeat(np.arange(num_points, dtype=np.int32), num_neighbors)
-    core_children = neighbors.flatten()
-    core_children = in_cluster_ids[core_children]
-    core_distances = np.sqrt(
-        ((cluster_data - data[neighbors[:, -1], :]) ** 2).sum(axis=1)
-    )
-    np.minimum(core_parent, core_children, edges[num_mst:, 0])
-    np.maximum(core_parent, core_children, edges[num_mst:, 1])
-    np.maximum(
-        core_distances[core_parent], core_distances[core_children], distances[num_mst:]
-    )
-
-    # extract uniques
-    edges, unique_indices = np.unique(
-        edges[edges[:, 0] > -1.0, :], axis=0, return_index=True
-    )
-    distances = distances[unique_indices]
-
-    # compute centralities
-    centroid = np.average(cluster_data, axis=0, weights=cluster_probabilities)
-    centralities = 1 / ((cluster_data - centroid) ** 2).sum(axis=1).astype(np.float32)
-    weights = np.maximum(centralities[edges[:, 0]], centralities[edges[:, 1]])
-    return (
-        np.column_stack((edges.astype(np.float32), weights, distances)),
-        centralities,
-    )
-
-
-def extract_branches_from_graph(
-    edges,
-    num_points,
-    min_branch_size=None,
-    max_branch_size=np.inf,
-    allow_single_branch=False,
-    branch_selection_method="eom",
-    branch_selection_epsilon=0.0,
-    branch_selection_persistence=0.0,
-    overridden_labels=False,
-):
-    # Compute centrality-mst
-    centrality_mst = minimum_spanning_tree(
-        coo_array(
-            (edges[:, 2], (edges[:, 0].astype(np.int32), edges[:, 1].astype(np.int32))),
-            shape=(num_points, num_points),
-        ),
-        overwrite=True,
-    )
-
-    # Check that the cluster is a single component
-    if overridden_labels:
-        num_components, labels = connected_components(centrality_mst, directed=False)
-        assert len(labels) == num_points
-        if num_components > 1:
-            return (
-                labels.astype(np.int64),
-                np.ones(len(labels), dtype=np.float32),
-                np.empty((0, 4)),
-                empty_condensed_tree(),
-            )
-
-    # Compute branches from the centrality-mst
-    centrality_mst = centrality_mst.tocoo()
-    return fast_hdbscan_mst_edges(
-        np.column_stack((centrality_mst.row, centrality_mst.col, centrality_mst.data)),
-        min_cluster_size=min_branch_size,
-        max_cluster_size=max_branch_size,
-        allow_single_cluster=allow_single_branch,
-        cluster_selection_method=branch_selection_method,
-        cluster_selection_epsilon=branch_selection_epsilon,
-        cluster_selection_persistence=branch_selection_persistence,
-    )[:-1]
+@numba.njit(fastmath=True)
+def compute_centrality(data, probabilities):
+    centroid = np.zeros((1, data.shape[1]), dtype=data.dtype)
+    for coord, prob in zip(data, probabilities):
+        centroid += coord * prob
+    centroid /= probabilities.sum()
+    return 1 / np.sqrt(((data - centroid) ** 2).sum(axis=1))
 
 
 def compute_branches_in_cluster(
     cluster,
     data,
-    cluster_labels,
-    cluster_probabilities,
+    labels,
+    probabilities,
+    neighbors,
+    core_distances,
     min_spanning_tree,
     parent_labels,
     child_labels,
-    neighbors,
     **kwargs,
 ):
-    # Extract this cluster's values
-    points = np.where(cluster_labels == cluster)[0]
-    neighbors = neighbors[points, :]
-    cluster_probabilities = cluster_probabilities[points]
+    # Compute centralities
+    points = np.nonzero(labels == cluster)[0]
+    centralities = compute_centrality(data[points, :], probabilities[points])
+
+    # Convert to within cluster indices (-1 indicates invalid neighbor)
+    in_cluster_ids = np.full(data.shape[0], -1, dtype=np.int32)
+    in_cluster_ids[points] = np.arange(len(points))
+    neighbors = in_cluster_ids[neighbors[points, :]]
+    core_distances = core_distances[points]
     min_spanning_tree = min_spanning_tree[
         (parent_labels == cluster) & (child_labels == cluster)
     ]
-    edges, centralities = extract_core_graph(
-        data, neighbors, min_spanning_tree, cluster_probabilities, points
-    )
-    (labels, probabilities, linkage_tree, condensed_tree) = extract_branches_from_graph(
-        edges, len(points), **kwargs
-    )
+    min_spanning_tree[:, :2] = in_cluster_ids[min_spanning_tree[:, :2].astype(np.int64)]
 
-    # Relabel graph with data point ids.
-    edges[:, 0] = points[edges[:, 0].astype(np.intp)]
-    edges[:, 1] = points[edges[:, 1].astype(np.intp)]
+    # Compute branches from core graph
     return (
-        labels,
-        probabilities,
+        *core_graph_clusters(
+            centralities,
+            neighbors,
+            core_distances,
+            min_spanning_tree,
+            **{
+                key.replace("branch", "cluster"): value for key, value in kwargs.items()
+            },
+        ),
         centralities,
         points,
-        edges,
-        linkage_tree,
-        condensed_tree,
     )
 
 
-@numba.njit()
+def parallel_branches_per_cluster(
+    data,
+    labels,
+    probabilities,
+    neighbors,
+    core_distances,
+    min_spanning_tree,
+    num_clusters,
+    **kwargs,
+):
+    # Loop could be parallel over clusters, but njit-compiling all called
+    # functions slows down imports with a factor > 2 for small gains. Instead,
+    # parts of each loop are parallel over points in the clusters.
+    parent_labels = labels[min_spanning_tree[:, 0].astype(np.int64)]
+    child_labels = labels[min_spanning_tree[:, 1].astype(np.int64)]
+    return [
+        compute_branches_in_cluster(
+            cluster,
+            data,
+            labels,
+            probabilities,
+            neighbors,
+            core_distances,
+            min_spanning_tree,
+            parent_labels,
+            child_labels,
+            **kwargs,
+        )
+        for cluster in numba.prange(num_clusters)
+    ]
+
+
 def update_labels(
     cluster_probabilities,
     branch_label_list,
@@ -184,19 +128,19 @@ def update_labels(
             labels[points] = running_id
             running_id += 1
         else:
-            _labels[_labels == -1] = num_branches
+            noise_mask = np.nonzero(_labels == -1)[0]
+            _labels[noise_mask] = num_branches
             labels[points] = _labels + running_id
             branch_labels[points] = _labels
             branch_probs[points] = _probs
             probabilities[points] += _probs
             probabilities[points] /= 2
-            running_id += num_branches + 1
+            running_id += num_branches + int(len(noise_mask) > 0)
         centralities[points] = _centralities
 
     return labels, probabilities, branch_labels, branch_probs, centralities
 
 
-@numba.njit()
 def remap_results(
     labels,
     probabilities,
@@ -206,7 +150,6 @@ def remap_results(
     branch_probabilities,
     centralities,
     points,
-    graphs,
     finite_index,
     num_points,
 ):
@@ -244,9 +187,6 @@ def remap_results(
 
     for pts in points:
         pts[:] = finite_index[pts]
-    for graph in graphs:
-        graph[:, 0] = finite_index[graph[:, 0].astype(np.intp)]
-        graph[:, 1] = finite_index[graph[:, 1].astype(np.intp)]
 
     return (
         labels,
@@ -257,7 +197,6 @@ def remap_results(
         branch_probabilities,
         centralities,
         points,
-        graphs,
     )
 
 
@@ -279,9 +218,8 @@ def detect_branches_in_clusters(
         msg="You first need to fit the HDBSCAN model before detecting branches",
     )
 
-    overridden_labels = True
+    # Validate input parameters
     if cluster_labels is None:
-        overridden_labels = False
         cluster_labels = clusterer.labels_
     elif cluster_probabilities is None:
         cluster_probabilities = np.ones(cluster_labels.shape[0], dtype=np.float32)
@@ -334,44 +272,32 @@ def detect_branches_in_clusters(
         cluster_probabilities = cluster_probabilities[finite_index]
 
     # Compute per-cluster branches
-    neighbors = clusterer._neighbors
     num_clusters = np.max(cluster_labels) + 1
-    min_spanning_tree = clusterer._min_spanning_tree
-    parent_labels = cluster_labels[min_spanning_tree[:, 0].astype(np.int64)]
-    child_labels = cluster_labels[min_spanning_tree[:, 1].astype(np.int64)]
     (
         branch_labels,
         branch_probabilities,
-        centralities,
-        points,
-        graphs,
         linkage_trees,
         condensed_trees,
-    ) = tuple(
-        zip(
-            *[
-                compute_branches_in_cluster(
-                    cluster,
-                    data,
-                    cluster_labels,
-                    cluster_probabilities,
-                    min_spanning_tree,
-                    parent_labels,
-                    child_labels,
-                    neighbors,
-                    min_branch_size=min_branch_size,
-                    max_branch_size=max_branch_size,
-                    allow_single_branch=allow_single_branch,
-                    branch_selection_method=branch_selection_method,
-                    branch_selection_epsilon=branch_selection_epsilon,
-                    branch_selection_persistence=branch_selection_persistence,
-                    overridden_labels=overridden_labels,
-                )
-                for cluster in range(num_clusters)
-            ]
+        spanning_trees,
+        core_graphs,
+        centralities,
+        points,
+    ) = zip(
+        *parallel_branches_per_cluster(
+            data,
+            cluster_labels,
+            cluster_probabilities,
+            clusterer._neighbors,
+            clusterer._core_distances,
+            clusterer._min_spanning_tree,
+            num_clusters,
+            min_branch_size=min_branch_size,
+            max_branch_size=max_branch_size,
+            allow_single_branch=allow_single_branch,
+            branch_selection_method=branch_selection_method,
+            branch_selection_epsilon=branch_selection_epsilon,
+            branch_selection_persistence=branch_selection_persistence,
         )
-        if num_clusters > 0
-        else ([], [], [], [], [], [], [])
     )
 
     # Handle override labels failure cases
@@ -405,7 +331,6 @@ def detect_branches_in_clusters(
             branch_probabilities,
             centralities,
             points,
-            graphs,
         ) = remap_results(
             labels,
             probabilities,
@@ -415,7 +340,6 @@ def detect_branches_in_clusters(
             branch_probabilities,
             centralities,
             points,
-            graphs,
             finite_index,
             clusterer._raw_data.shape[0],
         )
@@ -427,12 +351,12 @@ def detect_branches_in_clusters(
         cluster_probabilities,
         branch_labels,
         branch_probabilities,
-        graphs,
+        core_graphs,
         condensed_trees,
         linkage_trees,
+        spanning_trees,
         centralities,
         points,
-        data,
     )
 
 
@@ -473,7 +397,7 @@ class BranchDetector(BaseEstimator, ClusterMixin):
         self.label_sides_as_branches = label_sides_as_branches
 
     def fit(self, clusterer, labels=None, probabilities=None):
-        # labels and probabilities override the clusterer's values.
+        """labels and probabilities override the clusterer's values."""
         (
             self.labels_,
             self.probabilities_,
@@ -484,12 +408,15 @@ class BranchDetector(BaseEstimator, ClusterMixin):
             self._approximation_graphs,
             self._condensed_trees,
             self._linkage_trees,
+            self._spanning_trees,
             self.centralities_,
             self.cluster_points_,
-            self._raw_data,
         ) = detect_branches_in_clusters(
             clusterer, labels, probabilities, **self.get_params()
         )
+        # also store the core distances and raw data for the member functions
+        self._raw_data = clusterer._raw_data
+        self._core_distances = clusterer._core_distances
         return self
 
     def fit_predict(self, clusterer, labels=None, probabilities=None):
@@ -504,13 +431,38 @@ class BranchDetector(BaseEstimator, ClusterMixin):
             "_approximation_graphs",
             msg="You first need to fit the BranchDetector model before accessing the approximation graphs",
         )
+
+        # Convert to edgelist and reconstruct (approximate) distances. We did not track
+        # mst-edge distances, recomputing them here is to worth the effort.
+        edge_lists = []
+        for graph, points in zip(self._approximation_graphs, self.cluster_points_):
+            count = 0
+            num_edges = graph.child_counts.sum()
+            edges = np.empty((num_edges, 4), dtype=np.float64)
+            for parent, (centrality, indices, n_children) in enumerate(
+                zip(graph.distances, graph.indices, graph.child_counts)
+            ):
+                next_count = count + n_children
+                edges[count:next_count, 0] = points[parent]
+                edges[count:next_count, 1] = points[
+                    indices[:n_children].astype(np.int64)
+                ]
+                edges[count:next_count, 2] = centrality[:n_children]
+                np.maximum(
+                    self._core_distances[edges[count:next_count, 0].astype(np.intp)],
+                    self._core_distances[edges[count:next_count, 1].astype(np.intp)],
+                    out=edges[count:next_count, 3],
+                )
+                count = next_count
+            edge_lists.append(edges)
+
         return ApproximationGraph(
-            self._approximation_graphs,
+            edge_lists,
             self.labels_,
             self.probabilities_,
             self.cluster_labels_,
             self.cluster_probabilities_,
-            self.centralities_,
+            1 / self.centralities_,
             self.branch_labels_,
             self.branch_probabilities_,
             self._raw_data,
@@ -555,4 +507,16 @@ class BranchDetector(BaseEstimator, ClusterMixin):
         return [
             SingleLinkageTree(tree) if tree is not None else None
             for tree in self._linkage_trees
+        ]
+
+    @property
+    def spanning_trees_(self):
+        """See :class:`~hdbscan.branches.BranchDetector` for documentation."""
+        check_is_fitted(
+            self,
+            "_spanning_trees",
+            msg="You first need to fit the BranchDetector model before accessing the linkage trees",
+        )
+        return [
+            MinimumSpanningTree(tree, self._raw_data) for tree in self._spanning_trees
         ]

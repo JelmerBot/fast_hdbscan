@@ -80,7 +80,7 @@ def homogeneity(labels1, labels2):
 
 
 def test_hdbscan_feature_vector():
-    labels, p, ltree, ctree, mtree, neighbors = fast_hdbscan(X, return_trees=True)
+    labels, p, ltree, ctree, mtree, neighbors, cdists = fast_hdbscan(X, return_trees=True)
     n_clusters_1 = len(set(labels)) - int(-1 in labels)
     assert n_clusters_1 == n_clusters
 

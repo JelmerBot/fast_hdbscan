@@ -184,7 +184,7 @@ def fast_hdbscan(
 
     sklearn_tree = KDTree(data)
     numba_tree = kdtree_to_numba(sklearn_tree)
-    edges, neighbors = parallel_boruvka(
+    edges, neighbors, core_distances = parallel_boruvka(
         numba_tree,
         min_samples=min_cluster_size if min_samples is None else min_samples,
         sample_weights=sample_weights,
@@ -204,7 +204,8 @@ def fast_hdbscan(
             cluster_selection_persistence=cluster_selection_persistence,
             sample_weights=sample_weights,
         ), 
-        neighbors
+        neighbors,
+        core_distances
     )[: (None if return_trees else 2)]
 
 
@@ -257,7 +258,7 @@ def fast_hdbscan_mst_edges(
             )
     elif cluster_selection_method == "leaf":
         if cluster_tree.parent.shape[0] == 0:
-            selected_clusters = np.array([], dtype=np.int64)
+            selected_clusters = np.empty(0, dtype=np.int64)
         else:
             selected_clusters = extract_leaves(cluster_tree, n_points)
     else:
@@ -355,7 +356,8 @@ class HDBSCAN(BaseEstimator, ClusterMixin):
             self._single_linkage_tree,
             self._condensed_tree,
             self._min_spanning_tree,
-            self._neighbors
+            self._neighbors,
+            self._core_distances
         ) = fast_hdbscan(
             clean_data,
             clean_data_labels,
