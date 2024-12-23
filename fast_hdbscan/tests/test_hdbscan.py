@@ -15,7 +15,7 @@ from fast_hdbscan import (
     HDBSCAN,
     fast_hdbscan,
 )
-from fast_hdbscan.hdbscan import fast_hdbscan_mst_edges
+from fast_hdbscan.hdbscan import clusters_from_spanning_tree
 
 # from sklearn.cluster.tests.common import generate_clustered_data
 from sklearn.datasets import make_blobs
@@ -212,7 +212,7 @@ def test_mst_entry():
         linkage_tree, 
         condensed_tree, 
         sorted_mst
-    ) = fast_hdbscan_mst_edges(model._min_spanning_tree, min_cluster_size=5)
+    ) = clusters_from_spanning_tree(model._min_spanning_tree, min_cluster_size=5)
     assert np.all(model.labels_ == labels)
     assert np.allclose(model.probabilities_, probabilities)
     assert np.allclose(model._min_spanning_tree, sorted_mst)

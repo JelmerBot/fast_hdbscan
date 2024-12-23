@@ -3,7 +3,7 @@ import numpy as np
 from collections import namedtuple
 
 from .disjoint_set import ds_rank_create
-from .hdbscan import fast_hdbscan_mst_edges
+from .hdbscan import clusters_from_spanning_tree
 from .cluster_trees import empty_condensed_tree
 from .boruvka import merge_components, update_point_components
 
@@ -32,7 +32,7 @@ def core_graph_clusters(
         )
 
     return (
-        *fast_hdbscan_mst_edges(lensed_mst, **kwargs),
+        *clusters_from_spanning_tree(lensed_mst, **kwargs),
         core_graph,
     )
 

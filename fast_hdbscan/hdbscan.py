@@ -32,7 +32,6 @@ except ImportError:
     _HAVE_HDBSCAN = False
 
 
-
 def to_numpy_rec_array(named_tuple_tree):
     size = named_tuple_tree.parent.shape[0]
     result = np.empty(
@@ -182,17 +181,15 @@ def fast_hdbscan(
             "Cluster selection persistence must be a positive floating point number!"
         )
 
-    sklearn_tree = KDTree(data)
-    numba_tree = kdtree_to_numba(sklearn_tree)
-    edges, neighbors, core_distances = parallel_boruvka(
-        numba_tree,
+    minimum_spanning_tree, neighbors, core_distances = compute_minimum_spanning_tree(
+        data,
         min_samples=min_cluster_size if min_samples is None else min_samples,
         sample_weights=sample_weights,
     )
 
     return (
-        *fast_hdbscan_mst_edges(
-            edges,
+        *clusters_from_spanning_tree(
+            minimum_spanning_tree,
             data_labels=data_labels,
             semi_supervised=semi_supervised,
             ss_algorithm=ss_algorithm,
@@ -203,14 +200,23 @@ def fast_hdbscan(
             cluster_selection_epsilon=cluster_selection_epsilon,
             cluster_selection_persistence=cluster_selection_persistence,
             sample_weights=sample_weights,
-        ), 
+        ),
         neighbors,
-        core_distances
+        core_distances,
     )[: (None if return_trees else 2)]
 
 
-def fast_hdbscan_mst_edges(
-    edges,
+def compute_minimum_spanning_tree(data, min_samples=10, sample_weights=None):
+    sklearn_tree = KDTree(data)
+    numba_tree = kdtree_to_numba(sklearn_tree)
+    edges, neighbors, core_distances = parallel_boruvka(
+        numba_tree, min_samples=min_samples, sample_weights=sample_weights
+    )
+    return edges, neighbors, core_distances
+
+
+def clusters_from_spanning_tree(
+    minimum_spanning_tree,
     data_labels=None,
     semi_supervised=False,
     ss_algorithm='bc',
@@ -222,8 +228,8 @@ def fast_hdbscan_mst_edges(
     cluster_selection_persistence=0.0,
     sample_weights=None,
 ):
-    n_points = edges.shape[0] + 1
-    sorted_mst = edges[np.argsort(edges.T[2])]
+    n_points = minimum_spanning_tree.shape[0] + 1
+    sorted_mst = minimum_spanning_tree[np.argsort(minimum_spanning_tree.T[2])]
     
     if sample_weights is None:
         linkage_tree = mst_to_linkage_tree(sorted_mst)
