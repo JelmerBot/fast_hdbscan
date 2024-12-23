@@ -111,8 +111,8 @@ def test_override_cluster_labels():
     split_y[split_y == 2] = 1
     b = BranchDetector(label_sides_as_branches=True).fit(c, split_y)
     check_detected_groups(b, n_clusters=2, n_branches=5, overridden=True)
-    assert b.condensed_trees_[0] is None
-    assert b.linkage_trees_[0] is None
+    assert b._condensed_trees[0] is None
+    assert b._linkage_trees[0] is None
 
 
 def test_allow_single_branch_with_filters():
