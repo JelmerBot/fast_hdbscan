@@ -23,7 +23,7 @@ def knn_mst_union(neighbors, core_distances, min_spanning_tree, lens_values):
         children = graph[point]
         parent_lens = lens_values[point]
         parent_dist = core_distances[point]
-        for child in neighbors[point, 1:]:
+        for child in neighbors[point]:
             if child < 0:
                 continue
             children[child] = (
