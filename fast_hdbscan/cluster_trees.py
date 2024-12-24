@@ -540,13 +540,13 @@ def simplify_hierarchy(condensed_tree, n_points, persistence_threshold):
     keep_mask = np.ones(condensed_tree.parent.shape[0], dtype=np.bool_)
     cluster_tree = cluster_tree_from_condensed_tree(condensed_tree)
 
+    processed = {np.int64(0)}
+    processed.clear()
     while cluster_tree.parent.shape[0] > 0:
         leaves = set(extract_leaves(cluster_tree, n_points))
         births = max_lambdas(condensed_tree, leaves)
         deaths = min_lambdas(cluster_tree, leaves)
 
-        processed = {np.int64(0)}
-        processed.clear()
         cluster_mask = np.ones(cluster_tree.parent.shape[0], dtype=np.bool_)
         for leaf in sorted(leaves, reverse=True):
             if leaf in processed or (births[leaf] - deaths[leaf]) >= persistence_threshold:
@@ -562,11 +562,11 @@ def simplify_hierarchy(condensed_tree, n_points, persistence_threshold):
             sibling = cluster_tree.child[sibling_idx]
                         
             # Update parent values to the new parent
-            for idx, parent in enumerate(cluster_tree.parent):
-                if parent in [leaf, sibling]:
+            for idx, row in enumerate(cluster_tree.parent):
+                if row in [leaf, sibling]:
                     cluster_tree.parent[idx] = parent
-            for idx, parent in enumerate(condensed_tree.parent):
-                if parent in [leaf, sibling]:
+            for idx, row in enumerate(condensed_tree.parent):
+                if row in [leaf, sibling]:
                     condensed_tree.parent[idx] = parent
                     condensed_tree.lambda_val[idx] = deaths[leaf]
             
