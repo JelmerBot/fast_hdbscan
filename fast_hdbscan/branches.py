@@ -4,7 +4,7 @@ from sklearn.utils.validation import check_is_fitted
 from sklearn.base import BaseEstimator, ClusterMixin
 
 from .hdbscan import to_numpy_rec_array
-from .core_graph import core_graph_clusters
+from .core_graph import core_graph_clusters, core_graph_to_edge_list
 
 try:
     from hdbscan.plots import (
@@ -432,28 +432,11 @@ class BranchDetector(BaseEstimator, ClusterMixin):
             msg="You first need to fit the BranchDetector model before accessing the approximation graphs",
         )
 
-        # Convert to edgelist and reconstruct (approximate) distances. We did not track
-        # mst-edge distances, recomputing them here is to worth the effort.
         edge_lists = []
         for graph, points in zip(self._approximation_graphs, self.cluster_points_):
-            count = 0
-            num_edges = graph.child_counts.sum()
-            edges = np.empty((num_edges, 4), dtype=np.float64)
-            for parent, (centrality, indices, n_children) in enumerate(
-                zip(graph.distances, graph.indices, graph.child_counts)
-            ):
-                next_count = count + n_children
-                edges[count:next_count, 0] = points[parent]
-                edges[count:next_count, 1] = points[
-                    indices[:n_children].astype(np.int64)
-                ]
-                edges[count:next_count, 2] = centrality[:n_children]
-                np.maximum(
-                    self._core_distances[edges[count:next_count, 0].astype(np.intp)],
-                    self._core_distances[edges[count:next_count, 1].astype(np.intp)],
-                    out=edges[count:next_count, 3],
-                )
-                count = next_count
+            edges = core_graph_to_edge_list(graph)
+            edges[:, 0] = points[edges[:, 0].astype(np.int64)]
+            edges[:, 1] = points[edges[:, 1].astype(np.int64)]
             edge_lists.append(edges)
 
         return ApproximationGraph(

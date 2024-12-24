@@ -275,6 +275,7 @@ def parallel_boruvka(tree, min_samples=10, sample_weights=None):
     components_disjoint_set = ds_rank_create(tree.data.shape[0])
     point_components = np.arange(tree.data.shape[0])
     node_components = np.full(tree.node_data.shape[0], -1)
+    n_components = len(point_components)
 
     if sample_weights is not None:
         mean_sample_weight = np.mean(sample_weights)
@@ -293,11 +294,11 @@ def parallel_boruvka(tree, min_samples=10, sample_weights=None):
     new_edges = initialize_boruvka_from_knn(neighbors, core_distances, components_disjoint_set)
     while True:
         edges.append(new_edges)
+        n_components -= new_edges.shape[0]
+        if n_components == 1:
+            break
         update_point_components(components_disjoint_set, point_components)
         update_node_components(tree, node_components, point_components)
-        if np.unique(point_components).shape[0] == 1:
-            break
-        
         candidate_distances, candidate_indices = boruvka_tree_query(tree, node_components, point_components,
                                                                     core_distances)
         component_edges = select_components(candidate_distances, candidate_indices, point_components)

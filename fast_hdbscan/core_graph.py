@@ -7,148 +7,99 @@ from .hdbscan import clusters_from_spanning_tree
 from .cluster_trees import empty_condensed_tree
 from .boruvka import merge_components, update_point_components
 
-CoreGraph = namedtuple("CoreGraph", ["distances", "indices", "child_counts"])
-
-
-def core_graph_clusters(
-    lens,
-    neighbors,
-    core_distances,
-    min_spanning_tree,
-    **kwargs,
-):
-    core_graph = create_core_graph(neighbors, core_distances, min_spanning_tree, lens)
-    num_components, component_labels, lensed_mst = minimum_spanning_tree(core_graph)
-    if num_components > 1:
-        for i, label in enumerate(np.unique(component_labels)):
-            component_labels[component_labels == label] = i
-        return (
-            component_labels,
-            np.ones(len(component_labels), dtype=np.float32),
-            np.empty((0, 4)),
-            empty_condensed_tree(),
-            lensed_mst,
-            core_graph,
-        )
-
-    return (
-        *clusters_from_spanning_tree(lensed_mst, **kwargs),
-        core_graph,
-    )
+CoreGraph = namedtuple("CoreGraph", ["weights", "distances", "indices", "indptr"])
 
 
 @numba.njit(parallel=True)
-def create_core_graph(neighbors, core_distances, min_spanning_tree, lens_values):
-    """Computes union over knn and mst edges in knn-style adjacency format."""
-    # count non-knn mst edges
-    num_points = neighbors.shape[0]
-    counts = np.zeros(num_points, dtype=np.int32)
-    for parent, child, distance in min_spanning_tree:
-        parent = np.intp(parent)
-        child = np.intp(child)
-        if distance > max(core_distances[parent], core_distances[child]):
-            counts[parent] += 1
+def knn_mst_union(neighbors, core_distances, min_spanning_tree, lens_values):
+    # List of dictionaries of child: (weight, distance)
+    graph = [
+        {np.int32(0): (np.float64(0.0), np.float64(0.0)) for _ in range(0)}
+        for _ in range(neighbors.shape[0])
+    ]
 
-    # allocate space for all edges
-    max_children = np.max(counts) + 1
-    num_neighbors = neighbors.shape[1]
-    graph_indices = np.empty((num_points, num_neighbors + max_children), dtype=np.int32)
-    graph_distances = np.empty(
-        (num_points, num_neighbors + max_children), dtype=np.float32
-    )
-
-    # fill valid knn edges
-    counts[:] = 0
-    for point in numba.prange(num_points):
+    # Add knn edges
+    for point in numba.prange(len(core_distances)):
+        children = graph[point]
         parent_lens = lens_values[point]
-        for child in neighbors[point]:
+        parent_dist = core_distances[point]
+        for child in neighbors[point, 1:]:
             if child < 0:
                 continue
-            graph_indices[point, counts] = child
-            graph_distances[point, counts] = max(parent_lens, lens_values[child])
-            counts[point] += 1
-
-    # fill non-knn mst edges
-    for parent, child, distance in min_spanning_tree:
-        parent = np.intp(parent)
-        child = np.intp(child)
-        if distance > max(core_distances[parent], core_distances[child]):
-            graph_indices[parent, counts[parent]] = child
-            graph_distances[parent, counts[parent]] = max(
-                lens_values[parent], lens_values[child]
+            children[child] = (
+                max(parent_lens, lens_values[child]),
+                max(parent_dist, core_distances[child]),
             )
-            counts[parent] += 1
 
-    # sort by weights and fill remaining space with -1 and inf
-    max_children = np.max(counts)
-    for point in numba.prange(num_points):
-        order = np.argsort(graph_distances[point, : counts[point]])
-        graph_indices[point, : counts[point]] = graph_indices[point, order]
-        graph_distances[point, : counts[point]] = graph_distances[point, order]
-        graph_indices[point, counts[point] : max_children] = -1
-        graph_distances[point, counts[point] : max_children] = np.inf
+    # Add non-knn mst edges
+    for parent, child, distance in min_spanning_tree:
+        parent = np.int32(parent)
+        child = np.int32(child)
+        children = graph[parent]
+        if child in children:
+            continue
+        children[child] = (max(lens_values[parent], lens_values[child]), distance)
 
-    return CoreGraph(
-        graph_distances[:, :max_children], graph_indices[:, :max_children], counts
-    )
+    return graph
+
+
+@numba.njit(parallel=True)
+def sort_by_lens(graph):
+    for point in numba.prange(len(graph)):
+        graph[point] = {
+            k: v for k, v in sorted(graph[point].items(), key=lambda item: item[1][0])
+        }
+    return graph
+
+
+@numba.njit(parallel=True)
+def apply_lens(core_graph, lens_values):
+    # Apply new lens to the graph
+    for point in numba.prange(len(lens_values)):
+        children = core_graph[point]
+        point_lens = lens_values[point]
+        for child, value in children.items():
+            children[child] = (max(point_lens, lens_values[child]), value[1])
+    return sort_by_lens(core_graph)
 
 
 @numba.njit()
-def minimum_spanning_tree(core_graph, overwrite=False):
-    """
-    Implements Boruvka on knn-style adjacency format graph. The graph may
-    contain multiple connected components. (-1, inf) indicates invalid edges.
-    """
-    graph_indices = core_graph.indices
-    graph_distances = core_graph.distances
-    if not overwrite:
-        graph_indices = graph_indices.copy()
-        graph_distances = graph_distances.copy()
+def flatten_to_csr(graph):
+    # Count children to form indptr
+    num_points = len(graph)
+    indptr = np.empty(num_points + 1, dtype=np.int32)
+    indptr[0] = 0
+    for i, children in enumerate(graph):
+        indptr[i + 1] = indptr[i] + len(children)
 
-    disjoint_set = ds_rank_create(graph_distances.shape[0])
-    point_components = np.arange(graph_distances.shape[0])
-    n_components = len(point_components)
+    # Flatten children to form indices, weights, and distances
+    weights = np.empty(indptr[-1], dtype=np.float32)
+    distances = np.empty(indptr[-1], dtype=np.float32)
+    indices = np.empty(indptr[-1], dtype=np.int32)
+    for point in numba.prange(num_points):
+        start = indptr[point]
+        children = graph[point]
+        for j, (child, (weight, distance)) in enumerate(children.items()):
+            weights[start + j] = weight
+            distances[start + j] = distance
+            indices[start + j] = child
 
-    edges_list = [np.empty((0, 3), dtype=np.float64) for _ in range(0)]
-    while n_components > 1:
-        new_edges = merge_components(
-            disjoint_set,
-            select_components(
-                graph_distances[:, 0], graph_indices[:, 0], point_components
-            ),
-        )
-        if new_edges.shape[0] == 0:
-            break
-
-        edges_list.append(new_edges)
-        update_point_components(disjoint_set, point_components)
-        update_graph_components(graph_distances, graph_indices, point_components)
-        n_components = len(np.unique(point_components))
-
-    counter = 0
-    num_edges = 0
-    for edges in edges_list:
-        num_edges += edges.shape[0]
-    result = np.empty((num_edges, 3), dtype=np.float64)
-    for edges in edges_list:
-        result[counter : counter + edges.shape[0]] = edges
-        counter += edges.shape[0]
-    return n_components, point_components, result
+    # Return as named csr tuple
+    return CoreGraph(weights, distances, indices, indptr)
 
 
 @numba.njit(locals={"parent": numba.types.int32})
-def select_components(candidate_distances, candidate_neighbors, point_components):
-    """Skips invalid edges indicated by -1 neighbors and inf distances"""
+def select_components(graph, point_components):
     component_edges = {
         np.int64(0): (np.int32(0), np.int32(1), np.float32(0.0)) for _ in range(0)
     }
 
     # Find the best edges from each component
-    for parent, (distance, neighbor, from_component) in enumerate(
-        zip(candidate_distances, candidate_neighbors, point_components)
-    ):
-        if neighbor < 0:
+    for parent, (children, from_component) in enumerate(zip(graph, point_components)):
+        if len(children) == 0:
             continue
+        neighbor = next(iter(children.keys()))
+        distance = np.float32(children[neighbor][0])
         if from_component in component_edges:
             if distance < component_edges[from_component][2]:
                 component_edges[from_component] = (parent, neighbor, distance)
@@ -158,17 +109,111 @@ def select_components(candidate_distances, candidate_neighbors, point_components
     return component_edges
 
 
-@numba.njit(parallel=True)
-def update_graph_components(distances, indices, point_components):
-    """Sets neighbors to (-1, inf) if they connect points in the same component"""
-    for point in numba.prange(point_components.shape[0]):
-        count = 0
-        for col, dist in zip(indices[point], distances[point]):
-            if col < 0:
-                break
-            if point_components[col] != point_components[point]:
-                indices[point, count] = col
-                distances[point, count] = dist
-                count += 1
-        indices[point, count:] = -1
-        distances[point, count:] = np.inf
+@numba.njit()  # enabling parallel breaks this function
+def update_graph_components(graph, point_components):
+    # deleting from dictionary during iteration breaks in numba.
+    for point in numba.prange(len(graph)):
+        graph[point] = {
+            child: (weight, distance)
+            for child, (weight, distance) in graph[point].items()
+            if point_components[child] != point_components[point]
+        }
+
+
+@numba.njit()
+def minimum_spanning_tree(graph, overwrite=False):
+    """
+    Implements Boruvka on lod-style graph with multiple connected components.
+    """
+    if not overwrite:
+        graph = [children for children in graph]
+
+    disjoint_set = ds_rank_create(len(graph))
+    point_components = np.arange(len(graph))
+    n_components = len(point_components)
+
+    edges_list = [np.empty((0, 3), dtype=np.float64) for _ in range(0)]
+    while n_components > 1:
+        new_edges = merge_components(
+            disjoint_set,
+            select_components(graph, point_components),
+        )
+        if new_edges.shape[0] == 0:
+            break
+
+        edges_list.append(new_edges)
+        update_point_components(disjoint_set, point_components)
+        update_graph_components(graph, point_components)
+        n_components -= new_edges.shape[0]
+
+    counter = 0
+    num_edges = sum([edges.shape[0] for edges in edges_list])
+    result = np.empty((num_edges, 3), dtype=np.float64)
+    for edges in edges_list:
+        result[counter : counter + edges.shape[0]] = edges
+        counter += edges.shape[0]
+    return n_components, point_components, result
+
+
+@numba.njit()
+def core_graph_spanning_tree(neighbors, core_distances, min_spanning_tree, lens):
+    graph = sort_by_lens(
+        knn_mst_union(neighbors, core_distances, min_spanning_tree, lens)
+    )
+    return (*minimum_spanning_tree(graph), flatten_to_csr(graph))
+
+
+def core_graph_clusters(
+    lens,
+    neighbors,
+    core_distances,
+    min_spanning_tree,
+    **kwargs,
+):
+    num_components, component_labels, lensed_mst, graph = core_graph_spanning_tree(
+        neighbors, core_distances, min_spanning_tree, lens
+    )
+    if num_components > 1:
+        for i, label in enumerate(np.unique(component_labels)):
+            component_labels[component_labels == label] = i
+        return (
+            component_labels,
+            np.ones(len(component_labels), dtype=np.float32),
+            np.empty((0, 4)),
+            empty_condensed_tree(),
+            lensed_mst,
+            graph,
+        )
+
+    return (
+        *clusters_from_spanning_tree(lensed_mst, **kwargs),
+        graph,
+    )
+
+
+def core_graph_to_rec_array(graph):
+    result = np.empty(
+        graph.indptr[-1],
+        dtype=[
+            ("parent", np.int32),
+            ("child", np.int32),
+            ("weight", np.float32),
+            ("distance", np.float32),
+        ],
+    )
+    result["parent"] = np.repeat(
+        np.arange(len(graph.indptr) - 1), np.diff(graph.indptr)
+    )
+    result["child"] = graph.indices
+    result["weight"] = graph.weights
+    result["distance"] = graph.distances
+    return result
+
+
+def core_graph_to_edge_list(graph):
+    result = np.empty((graph.indptr[-1], 4), dtype=np.float64)
+    result[:, 0] = np.repeat(np.arange(len(graph.indptr) - 1), np.diff(graph.indptr))
+    result[:, 1] = graph.indices
+    result[:, 2] = graph.weights
+    result[:, 3] = graph.distances
+    return result

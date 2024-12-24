@@ -54,6 +54,9 @@ def check_detected_groups(c, n_clusters=3, n_branches=6, overridden=False):
     assert (c.cluster_probabilities_[noise_mask] == 0.0).all()
     if not overridden:
         assert len(c.cluster_points_) == n_clusters
+        for condensed_tree, linkage_tree in zip(c._condensed_trees, c._linkage_trees):
+            assert linkage_tree is not None
+            assert condensed_tree is not None
 
 
 # --- Detecting Branches
