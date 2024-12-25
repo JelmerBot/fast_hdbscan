@@ -4,11 +4,8 @@ Test for the branches module.
 
 import pytest
 import numpy as np
-from numba import set_num_threads
 from sklearn.exceptions import NotFittedError
 from fast_hdbscan import HDBSCAN, BranchDetector, detect_branches_in_clusters
-
-set_num_threads(1)
 
 
 def make_branches(points_per_branch=30):
