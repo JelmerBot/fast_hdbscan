@@ -5,7 +5,7 @@ Test for the branches module.
 import pytest
 import numpy as np
 from sklearn.exceptions import NotFittedError
-from fast_hdbscan import HDBSCAN, BranchDetector, detect_branches_in_clusters
+from fast_hdbscan import HDBSCAN, BranchDetector, find_branch_sub_clusters
 
 
 def make_branches(points_per_branch=30):
@@ -147,27 +147,27 @@ def test_badargs():
     c_nofit = HDBSCAN(min_cluster_size=5)
 
     with pytest.raises(TypeError):
-        detect_branches_in_clusters("fail")
+        find_branch_sub_clusters("fail")
     with pytest.raises(TypeError):
-        detect_branches_in_clusters(None)
+        find_branch_sub_clusters(None)
     with pytest.raises(NotFittedError):
-        detect_branches_in_clusters(c_nofit)
+        find_branch_sub_clusters(c_nofit)
     with pytest.raises(ValueError):
-        detect_branches_in_clusters(c, min_branch_size=-1)
+        find_branch_sub_clusters(c, min_branch_size=-1)
     with pytest.raises(ValueError):
-        detect_branches_in_clusters(c, min_branch_size=0)
+        find_branch_sub_clusters(c, min_branch_size=0)
     with pytest.raises(ValueError):
-        detect_branches_in_clusters(c, min_branch_size=1)
+        find_branch_sub_clusters(c, min_branch_size=1)
     with pytest.raises(ValueError):
-        detect_branches_in_clusters(c, min_branch_size=2.0)
+        find_branch_sub_clusters(c, min_branch_size=2.0)
     with pytest.raises(ValueError):
-        detect_branches_in_clusters(c, min_branch_size="fail")
+        find_branch_sub_clusters(c, min_branch_size="fail")
     with pytest.raises(ValueError):
-        detect_branches_in_clusters(c, branch_selection_persistence=-0.1)
+        find_branch_sub_clusters(c, branch_selection_persistence=-0.1)
     with pytest.raises(ValueError):
-        detect_branches_in_clusters(c, branch_selection_epsilon=-0.1)
+        find_branch_sub_clusters(c, branch_selection_epsilon=-0.1)
     with pytest.raises(ValueError):
-        detect_branches_in_clusters(
+        find_branch_sub_clusters(
             c,
             branch_selection_method="something_else",
         )
