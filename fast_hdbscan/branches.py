@@ -1,10 +1,12 @@
 import numpy as np
-from .sub_cluster import SubClusterDetector, find_sub_clusters
+from .sub_clusters import SubClusterDetector, find_sub_clusters
 
 
 def compute_centrality(data, probabilities, *args):
-    centroid = np.mean(data, weights=probabilities, axis=0)
-    return 1 / np.linalg.norm(data, centroid[:, None], axis=1)
+    points = args[-1]
+    cluster_data = data[points, :]
+    centroid = np.average(cluster_data, weights=probabilities[points], axis=0)
+    return 1 / np.linalg.norm(cluster_data - centroid[None, :], axis=1)
 
 
 def apply_branch_threshold(
@@ -18,7 +20,7 @@ def apply_branch_threshold(
 ):
     running_id = 0
     min_branch_count = 1 if label_sides_as_branches else 2
-    for pts, tree in zip(points, linkage_trees):
+    for pts, tree in zip(cluster_points, linkage_trees):
         unique_branch_labels = np.unique(branch_labels[pts])
         has_noise = int(unique_branch_labels[0] == -1)
         num_branches = len(unique_branch_labels) - has_noise
@@ -28,8 +30,7 @@ def apply_branch_threshold(
             running_id += 1
             continue
         else:
-            mask = branch_labels[pts] < 0
-            branch_labels[pts][mask] = num_branches
+            branch_labels[pts] = np.where(branch_labels[pts] < 0, num_branches, branch_labels[pts])
             labels[pts] = branch_labels[pts] + running_id
             running_id += num_branches + has_noise
 
@@ -38,6 +39,7 @@ def find_branch_sub_clusters(
     clusterer,
     cluster_labels=None,
     cluster_probabilities=None,
+    *,
     min_branch_size=None,
     max_branch_size=np.inf,
     allow_single_branch=False,
@@ -88,7 +90,7 @@ class BranchDetector(SubClusterDetector):
     """
 
     def __init__(
-        self,
+        self, *,
         min_branch_size=None,
         max_branch_size=np.inf,
         allow_single_branch=False,
@@ -98,7 +100,6 @@ class BranchDetector(SubClusterDetector):
         label_sides_as_branches=False,
     ):
         super().__init__(
-            lens_callback=compute_centrality,
             min_cluster_size=min_branch_size,
             max_cluster_size=max_branch_size,
             allow_single_cluster=allow_single_branch,
@@ -109,15 +110,17 @@ class BranchDetector(SubClusterDetector):
         self.label_sides_as_branches = label_sides_as_branches
 
     def fit(self, clusterer, labels=None, probabilities=None):
-        super().fit(clusterer, labels, probabilities)
+        super().fit(clusterer, labels, probabilities, compute_centrality)
         apply_branch_threshold(
             self.labels_,
             self.sub_cluster_labels_,
             self.probabilities_,
             self.cluster_probabilities_,
             self.cluster_points_,
+            self.linkage_trees_,
             label_sides_as_branches=self.label_sides_as_branches,
         )
         self.branch_labels_ = self.sub_cluster_labels_
         self.branch_probabilities_ = self.sub_cluster_probabilities_
         self.centralities_ = self.lens_values_
+        return self

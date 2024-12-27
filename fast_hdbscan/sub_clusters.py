@@ -1,3 +1,7 @@
+"""
+Converts data point lens values into edge distances and looks for clusters
+induced by those distances within the clusters found by HDBSCAN.
+"""
 import numba
 import numpy as np
 from sklearn.utils.validation import check_is_fitted
@@ -34,11 +38,12 @@ def compute_sub_clusters_in_cluster(
 
     # Compute lens_values
     lens_values = lens_callback(
-        data[points, :],
-        probabilities[points],
+        data,
+        probabilities,
         neighbors,
         core_distances,
         min_spanning_tree,
+        points
     )
 
     # Compute branches from core graph
@@ -183,7 +188,7 @@ def find_sub_clusters(
     clusterer,
     cluster_labels=None,
     cluster_probabilities=None,
-    lens_callback=None,
+    lens_callback=None, *,
     min_cluster_size=None,
     max_cluster_size=np.inf,
     allow_single_cluster=False,
@@ -243,6 +248,7 @@ def find_sub_clusters(
 
     # Recover finite data points
     data = clusterer._raw_data
+    num_points = data.shape[0]
     last_outlier = np.searchsorted(
         clusterer._condensed_tree["lambda_val"], 0.0, side="right"
     )
@@ -256,7 +262,7 @@ def find_sub_clusters(
 
     # Convert lens value array to callback
     if isinstance(lens_callback, np.ndarray):
-        if len(lens_callback) != data.shape[0]:
+        if len(lens_callback) != num_points:
             raise ValueError(
                 "when providing values as lens_callback, they must have"
                 f"the same length as the data, {len(lens_callback)} != {data.shape[0]}"
@@ -266,7 +272,7 @@ def find_sub_clusters(
         else:
             lens_values = lens_callback
 
-        lens_callback = lambda a, b, c, d, e: lens_values
+        lens_callback = lambda a, b, c, d, e, pts: lens_values[pts]
 
     # Compute per-cluster sub clusters
     num_clusters = np.max(cluster_labels) + 1
@@ -331,8 +337,8 @@ def find_sub_clusters(
             probabilities,
             cluster_labels,
             cluster_probabilities,
-            branch_labels,
-            branch_probabilities,
+            sub_labels,
+            sub_probabilities,
             lens_values,
             points,
             finite_index,
@@ -355,13 +361,13 @@ def find_sub_clusters(
     )
 
 
-class SubClusterDetector:
+class SubClusterDetector(ClusterMixin, BaseEstimator):
     """Performs a lens-value sub-cluster detection post-processing step
     on a HDBSCAN clusterer."""
 
     def __init__(
-        self,
-        lens_callback,
+        self, *,
+        lens_values=None,
         min_cluster_size=None,
         max_cluster_size=np.inf,
         allow_single_cluster=False,
@@ -369,7 +375,7 @@ class SubClusterDetector:
         cluster_selection_epsilon=0.0,
         cluster_selection_persistence=0.0,
     ):
-        self.lens_callback = lens_callback
+        self.lens_values = lens_values
         self.min_cluster_size = min_cluster_size
         self.max_cluster_size = max_cluster_size
         self.allow_single_cluster = allow_single_cluster
@@ -377,8 +383,11 @@ class SubClusterDetector:
         self.cluster_selection_epsilon = cluster_selection_epsilon
         self.cluster_selection_persistence = cluster_selection_persistence
 
-    def fit(self, clusterer, labels=None, probabilities=None):
+    def fit(self, clusterer, labels=None, probabilities=None, lens_callback=None):
         """labels and probabilities override the clusterer's values."""
+        # Use explicit keyword arguments because get_params breaks with
+        # inherited classes.
+        callback = self.lens_values if lens_callback is None else lens_callback
         (
             self.labels_,
             self.probabilities_,
@@ -392,7 +401,15 @@ class SubClusterDetector:
             self._spanning_trees,
             self.lens_values_,
             self.cluster_points_,
-        ) = find_sub_clusters(clusterer, labels, probabilities, **self.get_params())
+        ) = find_sub_clusters(
+            clusterer, labels, probabilities, callback,
+            min_cluster_size = self.min_cluster_size,
+            max_cluster_size = self.max_cluster_size,
+            allow_single_cluster = self.allow_single_cluster,
+            cluster_selection_method = self.cluster_selection_method,
+            cluster_selection_epsilon = self.cluster_selection_epsilon,
+            cluster_selection_persistence = self.cluster_selection_persistence,
+        )
         # also store the core distances and raw data for the member functions
         self._raw_data = clusterer._raw_data
         self._core_distances = clusterer._core_distances
@@ -446,12 +463,7 @@ class SubClusterDetector:
             (
                 CondensedTree(
                     tree,
-                    np.where(
-                        self.branch_labels_[points]
-                        == self.branch_labels_[points].max(),
-                        -1,
-                        self.branch_labels_[points],
-                    ),
+                    self.sub_cluster_labels_[points],
                 )
                 if tree is not None
                 else None

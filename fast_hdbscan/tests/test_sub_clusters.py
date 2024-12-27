@@ -1,11 +1,10 @@
-"""
-Test for the branches module.
-"""
-
 import pytest
 import numpy as np
 from sklearn.exceptions import NotFittedError
-from fast_hdbscan import HDBSCAN, BranchDetector, find_branch_sub_clusters
+
+from fast_hdbscan import HDBSCAN
+from fast_hdbscan.branches import compute_centrality
+from fast_hdbscan.sub_clusters import SubClusterDetector, find_sub_clusters
 
 
 def make_branches(points_per_branch=30):
@@ -37,16 +36,17 @@ X = np.concatenate(
         make_branches()[:60] + np.array([0.3, 0]),
     )
 )
+centrality = compute_centrality(X, np.ones(X.shape[0]), np.arange(X.shape[0]))
 c = HDBSCAN(min_samples=5, min_cluster_size=10).fit(X)
 
 
-def check_detected_groups(c, n_clusters=3, n_branches=6, overridden=False):
-    """Checks branch_detector output for main invariants."""
+def check_detected_groups(c, n_clusters=3, n_subs=6, overridden=False):
+    """Checks SubClusterDetector output for main invariants."""
     noise_mask = c.labels_ == -1
-    assert np.all(np.unique(c.labels_[~noise_mask]) == np.arange(n_branches))
+    assert np.all(np.unique(c.labels_[~noise_mask]) == np.arange(n_subs))
     assert np.all(np.unique(c.cluster_labels_[~noise_mask]) == np.arange(n_clusters))
-    assert (c.branch_labels_[noise_mask] == 0).all()
-    assert (c.branch_probabilities_[noise_mask] == 1.0).all()
+    assert (c.sub_cluster_labels_[noise_mask] == 0).all()
+    assert (c.sub_cluster_probabilities_[noise_mask] == 1.0).all()
     assert (c.probabilities_[noise_mask] == 0.0).all()
     assert (c.cluster_probabilities_[noise_mask] == 0.0).all()
     if not overridden:
@@ -55,14 +55,13 @@ def check_detected_groups(c, n_clusters=3, n_branches=6, overridden=False):
             assert linkage_tree is not None
             assert condensed_tree is not None
 
-
-# --- Detecting Branches
+# --- Detecting SubClusters	
 
 
 def test_attributes():
     def check_attributes():
-        b = BranchDetector().fit(c)
-        check_detected_groups(b, n_clusters=2, n_branches=5)
+        b = SubClusterDetector(lens_values=centrality).fit(c)
+        check_detected_groups(b, n_clusters=2, n_subs=7)
         assert len(b.linkage_trees_) == 2
         assert len(b.condensed_trees_) == 2
         assert isinstance(b.condensed_trees_[0], CondensedTree)
@@ -78,28 +77,23 @@ def test_attributes():
 
 
 def test_selection_method():
-    b = BranchDetector(branch_selection_method="eom").fit(c)
-    check_detected_groups(b, n_clusters=2, n_branches=5)
+    b = SubClusterDetector(lens_values=centrality, cluster_selection_method="eom").fit(c)
+    check_detected_groups(b, n_clusters=2, n_subs=7)
 
-    b = BranchDetector(branch_selection_method="leaf").fit(c)
-    check_detected_groups(b, n_clusters=2, n_branches=5)
+    b = SubClusterDetector(lens_values=centrality, cluster_selection_method="leaf").fit(c)
+    check_detected_groups(b, n_clusters=2, n_subs=7)
 
 
-def test_min_branch_size():
-    b = BranchDetector(min_branch_size=7).fit(c)
-    labels, counts = np.unique(b.labels_[b.branch_probabilities_ > 0], return_counts=True)
+def test_min_cluster_size():
+    b = SubClusterDetector(lens_values=centrality, min_cluster_size=7).fit(c)
+    labels, counts = np.unique(b.labels_[b.sub_cluster_labels_ >= 0], return_counts=True)
     assert (counts[labels >= 0] >= 7).all()
-    check_detected_groups(b, n_clusters=2, n_branches=5)
+    check_detected_groups(b, n_clusters=2, n_subs=7)
 
 
-def test_label_sides_as_branches():
-    b = BranchDetector(label_sides_as_branches=True).fit(c)
-    check_detected_groups(b, n_clusters=2, n_branches=6)
-
-
-def test_max_branch_size():
-    b = BranchDetector(label_sides_as_branches=True, max_branch_size=25).fit(c)
-    check_detected_groups(b, n_clusters=2, n_branches=4)
+def test_max_cluster_size():
+    b = SubClusterDetector(lens_values=centrality, max_cluster_size=5).fit(c)
+    check_detected_groups(b, n_clusters=2, n_subs=2)
 
 
 def test_override_cluster_labels():
@@ -109,65 +103,69 @@ def test_override_cluster_labels():
     split_y = c.labels_.copy()
     split_y[split_y == 1] = 0
     split_y[split_y == 2] = 1
-    b = BranchDetector(label_sides_as_branches=True).fit(c, split_y)
-    check_detected_groups(b, n_clusters=2, n_branches=5, overridden=True)
+    b = SubClusterDetector(lens_values=centrality).fit(c, split_y)
+    check_detected_groups(b, n_clusters=2, n_subs=5, overridden=True)
     assert b._condensed_trees[0] is None
     assert b._linkage_trees[0] is None
 
 
-def test_allow_single_branch_with_filters():
+def test_allow_single_cluster_with_filters():
     # Without persistence, find 6 branches
-    b = BranchDetector(
-        min_branch_size=5,
-        branch_selection_method="leaf",
+    b = SubClusterDetector(
+        min_cluster_size=5,
+        lens_values=centrality,
+        cluster_selection_method="leaf",
     ).fit(c)
     unique_labels = np.unique(b.labels_)
-    assert len(unique_labels) == 5
+    assert len(unique_labels) == 8
 
     # Adding persistence removes the branches
-    b = BranchDetector(
-        min_branch_size=5,
-        branch_selection_method="leaf",
-        branch_selection_persistence=0.15,
+    b = SubClusterDetector(
+        min_cluster_size=5,
+        lens_values=centrality,
+        cluster_selection_method="leaf",
+        cluster_selection_persistence=0.15,
     ).fit(c)
     unique_labels = np.unique(b.labels_)
     assert len(unique_labels) == 2
 
     # Adding epsilon removes some branches
-    b = BranchDetector(
-        min_branch_size=5,
-        branch_selection_method="leaf",
-        branch_selection_epsilon=1 / 0.002,
+    b = SubClusterDetector(
+        min_cluster_size=5,
+        lens_values=centrality,
+        cluster_selection_method="leaf",
+        cluster_selection_epsilon=1 / 0.002,
     ).fit(c)
     unique_labels = np.unique(b.labels_)
     assert len(unique_labels) == 2
 
-
+    
 def test_badargs():
     c_nofit = HDBSCAN(min_cluster_size=5)
 
     with pytest.raises(TypeError):
-        find_branch_sub_clusters("fail")
+        find_sub_clusters("fail")
     with pytest.raises(TypeError):
-        find_branch_sub_clusters(None)
+        find_sub_clusters(None)
     with pytest.raises(NotFittedError):
-        find_branch_sub_clusters(c_nofit)
+        find_sub_clusters(c_nofit)
     with pytest.raises(ValueError):
-        find_branch_sub_clusters(c, min_branch_size=-1)
+        find_sub_clusters(c, min_cluster_size=-1)
     with pytest.raises(ValueError):
-        find_branch_sub_clusters(c, min_branch_size=0)
+        find_sub_clusters(c, min_cluster_size=0)
     with pytest.raises(ValueError):
-        find_branch_sub_clusters(c, min_branch_size=1)
+        find_sub_clusters(c, min_cluster_size=1)
     with pytest.raises(ValueError):
-        find_branch_sub_clusters(c, min_branch_size=2.0)
+        find_sub_clusters(c, min_cluster_size=2.0)
     with pytest.raises(ValueError):
-        find_branch_sub_clusters(c, min_branch_size="fail")
+        find_sub_clusters(c, min_cluster_size="fail")
     with pytest.raises(ValueError):
-        find_branch_sub_clusters(c, branch_selection_persistence=-0.1)
+        find_sub_clusters(c, cluster_selection_persistence=-0.1)
     with pytest.raises(ValueError):
-        find_branch_sub_clusters(c, branch_selection_epsilon=-0.1)
+        find_sub_clusters(c, cluster_selection_epsilon=-0.1)
     with pytest.raises(ValueError):
-        find_branch_sub_clusters(
+        find_sub_clusters(
             c,
-            branch_selection_method="something_else",
+            cluster_selection_method="something_else",
         )
+
