@@ -1,6 +1,6 @@
 import numba
 import numpy as np
-
+from heapq import heappush, heappop
 from collections import namedtuple
 
 from .disjoint_set import ds_rank_create, ds_find, ds_union_by_rank
@@ -544,54 +544,72 @@ def extract_eom_clusters(condensed_tree, cluster_tree, max_cluster_size=np.inf, 
     return np.asarray([node for node, selected in selected_clusters.items() if selected])
 
 
+SimplifyLeafItem = namedtuple("SimplifyLeafItem", ["death", "id", "idx"])
+
 @numba.njit()
 def simplify_hierarchy(condensed_tree, n_points, persistence_threshold):
+    # Data structures
     keep_mask = np.ones(condensed_tree.parent.shape[0], dtype=np.bool_)
+    queue = [SimplifyLeafItem(np.float32(0), np.int64(0), np.int64(0)) for _ in range(0)]
+    enqueued = set([np.int64(0) for _ in range(0)])
+
+    # Enqueue initial leaves. Processing leaves in decreasing death order
+    # ensures the cluster-tree does not have to change while processing the
+    # queue.
     cluster_tree = cluster_tree_from_condensed_tree(condensed_tree)
+    for leaf in cluster_tree_leaves(cluster_tree, n_points):
+        leaf_idx = np.searchsorted(cluster_tree.child, leaf)
+        death = cluster_tree.lambda_val[leaf_idx]
+        queue.append(SimplifyLeafItem(-death, leaf, leaf_idx))
+        enqueued.add(leaf)
+    
+    # Process detected leaves following the priority queue.
+    while queue:
+        # Skip leaves already processed as sibling
+        negative_death, leaf, leaf_idx = heappop(queue)
+        if leaf not in enqueued or leaf == n_points:
+            continue
+        enqueued.remove(leaf)
 
-    processed = {np.int64(0)}
-    processed.clear()
-    while cluster_tree.parent.shape[0] > 0:
-        leaves = set(cluster_tree_leaves(cluster_tree, n_points))
-        births = max_lambdas(condensed_tree, leaves)
-        deaths = min_lambdas(cluster_tree, leaves)
-
-        cluster_mask = np.ones(cluster_tree.parent.shape[0], dtype=np.bool_)
-        for leaf in sorted(leaves, reverse=True):
-            if leaf in processed or (births[leaf] - deaths[leaf]) >= persistence_threshold:
-                continue
+        # Keep leaves that meet the persistence threshold
+        birth = condensed_tree.lambda_val[condensed_tree.parent == leaf].max()
+        if (birth + negative_death) >= persistence_threshold:
+            continue
             
-            # Find rows for leaf and sibling
-            leaf_idx = np.searchsorted(cluster_tree.child, leaf)
-            parent = cluster_tree.parent[leaf_idx]
-            if leaf_idx > 0 and cluster_tree.parent[leaf_idx - 1] == parent:
-                sibling_idx = leaf_idx - 1 
-            else:
-                sibling_idx = leaf_idx + 1
-            sibling = cluster_tree.child[sibling_idx]
-                        
-            # Update parent values to the new parent
-            for idx, row in enumerate(cluster_tree.parent):
-                if row in [leaf, sibling]:
-                    cluster_tree.parent[idx] = parent
+        # Extract leaf information
+        #   Odd/even leaf indices use previous/next row as sibling
+        parent = cluster_tree.parent[leaf_idx]
+        sibling_idx = leaf_idx + (((leaf_idx % 2) * -2) + 1)
+        sibling = cluster_tree.child[sibling_idx]
+
+        if sibling not in enqueued:
+            # Update lambda values to avoid points below birth of sibling's
+            # children. Those points 'break' the condensed tree plot. The
+            # persistence of 'leaf' is guaranteed to be lower than the non-leaf
+            # 'sibling' (otherwise 'sibling' would have been a leaf). So,
+            # changing these lambda-value does not break the persistence
+            # threshold.
             for idx, row in enumerate(condensed_tree.parent):
-                if row in [leaf, sibling]:
-                    condensed_tree.parent[idx] = parent
-                    condensed_tree.lambda_val[idx] = deaths[leaf]
-            
-            # Mark visited rows
-            processed.add(leaf)
-            processed.add(sibling)
-            cluster_mask[leaf_idx] = False
-            cluster_mask[sibling_idx] = False
-            for idx, child in enumerate(condensed_tree.child):
-                if child in [leaf, sibling]:
-                    keep_mask[idx] = False
+                if row == leaf:
+                    condensed_tree.lambda_val[idx] = -negative_death
+        else:
+            # Detect that parent becomes a leaf because sibling is also a leaf.
+            parent_idx = np.searchsorted(cluster_tree.child, parent)
+            parent_death = cluster_tree.lambda_val[parent_idx]
+            heappush(queue, SimplifyLeafItem(-parent_death, parent, parent_idx))
+            enqueued.add(parent)
+            enqueued.remove(sibling)
 
-        if np.all(cluster_mask):
-            break
-        cluster_tree = mask_condensed_tree(cluster_tree, cluster_mask)
+        # 'Move' child points to the new parent
+        for idx, row in enumerate(condensed_tree.parent):
+            if row in [leaf, sibling]:
+                condensed_tree.parent[idx] = parent
 
+        # Mark visited rows for removal
+        for idx, child in enumerate(condensed_tree.child):
+            if child in [leaf, sibling]:
+                keep_mask[idx] = False
+        
     condensed_tree = mask_condensed_tree(condensed_tree, keep_mask)
     return remap_cluster_ids(condensed_tree, n_points)
 
@@ -769,14 +787,6 @@ def max_lambdas(tree, clusters):
             result[cluster] = max(result[cluster], tree.lambda_val[n])
 
     return result
-
-
-@numba.njit()
-def min_lambdas(cluster_tree, clusters):
-    return {
-        c: cluster_tree.lambda_val[np.searchsorted(cluster_tree.child, c)] 
-        for c in clusters
-    }
 
 
 @numba.njit()
