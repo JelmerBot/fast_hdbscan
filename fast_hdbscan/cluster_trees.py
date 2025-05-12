@@ -137,8 +137,8 @@ def bfs_from_hierarchy(hierarchy, bfs_root, num_points):
 
 
 @numba.njit()
-def eliminate_branch(branch_node, parent_node, lambda_value, parents, children, lambdas, sizes, idx, ignore, hierarchy,
-                     num_points):
+def eliminate_branch(branch_node, parent_node, lambda_value, parents, children, 
+                     lambdas, idx, ignore, hierarchy,num_points):
     if branch_node < num_points:
         parents[idx] = parent_node
         children[idx] = branch_node
@@ -167,14 +167,17 @@ def empty_condensed_tree():
     return CondensedTree(parents, parents, others, others)
 
 
-@numba.njit(fastmath=True)
+@numba.njit(
+    fastmath=True,
+    error_model="numpy",
+    locals={"left": numba.int64, "right": numba.int64},
+)
 def condense_tree(hierarchy, min_cluster_size=10, max_cluster_size=np.inf, sample_weights=None):
     root = 2 * hierarchy.shape[0]
     num_points = hierarchy.shape[0] + 1
     next_label = num_points + 1
 
-    node_list = bfs_from_hierarchy(hierarchy, root, num_points)
-
+    ignore = np.zeros(root + 1, dtype=np.bool_)
     relabel = np.zeros(root + 1, dtype=np.int64)
     relabel[root] = num_points
 
@@ -183,53 +186,48 @@ def condense_tree(hierarchy, min_cluster_size=10, max_cluster_size=np.inf, sampl
     lambdas = np.empty(root, dtype=np.float32)
     sizes = np.ones(root, dtype=np.float32)
 
-    ignore = np.zeros(root + 1, dtype=np.bool_) # 'bool' is no longer an attribute of 'numpy'
-
     if sample_weights is None:
         sample_weights = np.ones(num_points, dtype=np.float32)
 
     idx = 0
-
-    for node in node_list:
-        if ignore[node] or node < num_points:
+    for node in range(root, num_points - 1, -1):
+        if ignore[node]:
             continue
 
         parent_node = relabel[node]
-        l, r, d, _ = hierarchy[node - num_points]
-        left = np.int64(l)
-        right = np.int64(r)
-        if d > 0.0:
-            lambda_value = 1.0 / d
-        else:
-            lambda_value = np.inf
+        left, right, d, _ = hierarchy[node - num_points]
+        lambda_value = 1.0 / d
 
         left_count = np.float32(hierarchy[left - num_points, 3]) if left >= num_points else sample_weights[left]
         right_count = np.float32(hierarchy[right - num_points, 3]) if right >= num_points else sample_weights[right]
 
-        # The logic here is in a strange order, but it has non-trivial performance gains ...
-        # The most common case by far is a singleton on the left; and cluster on the right take care of this separately
-        if left < num_points and right_count >= min_cluster_size:
-            relabel[right] = parent_node
+        # The logic here is in a strange order, but it has non-trivial
+        # performance gains ... The most common case by far is a singleton on
+        # the right; and cluster on the left take care of this separately
+        if right < num_points and left_count >= min_cluster_size:
+            relabel[left] = parent_node
             parents[idx] = parent_node
-            children[idx] = left
+            children[idx] = right
             lambdas[idx] = lambda_value
             idx += 1
-        # Next most common is a small left cluster and a large right cluster: relabel the right node; eliminate the left branch
+        # Next most common is a small left cluster and a large right cluster:
+        # relabel the right node; eliminate the left branch
         elif left_count < min_cluster_size and right_count >= min_cluster_size:
             relabel[right] = parent_node
-            idx = eliminate_branch(left, parent_node, lambda_value, parents, children, lambdas, sizes, idx, ignore,
-                                   hierarchy, num_points)
-        # Then we have a large left cluster and a small right cluster: relabel the left node; eliminate the right branch
+            idx = eliminate_branch(left, parent_node, lambda_value, parents, children, 
+                                   lambdas, idx, ignore, hierarchy, num_points)
+        # Then we have a large left cluster and a small right cluster: relabel
+        # the left node; eliminate the right branch
         elif left_count >= min_cluster_size and right_count < min_cluster_size:
             relabel[left] = parent_node
-            idx = eliminate_branch(right, parent_node, lambda_value, parents, children, lambdas, sizes, idx, ignore,
-                                   hierarchy, num_points)
+            idx = eliminate_branch(right, parent_node, lambda_value, parents, children, 
+                                   lambdas, idx, ignore, hierarchy, num_points)
         # If both clusters are small then eliminate all branches
         elif left_count < min_cluster_size and right_count < min_cluster_size:
-            idx = eliminate_branch(left, parent_node, lambda_value, parents, children, lambdas, sizes, idx, ignore,
-                                   hierarchy, num_points)
-            idx = eliminate_branch(right, parent_node, lambda_value, parents, children, lambdas, sizes, idx, ignore,
-                                   hierarchy, num_points)
+            idx = eliminate_branch(left, parent_node, lambda_value, parents, children, 
+                                   lambdas, idx, ignore, hierarchy, num_points)
+            idx = eliminate_branch(right, parent_node, lambda_value, parents, children, 
+                                   lambdas, idx, ignore, hierarchy, num_points)
         # If both clusters are too large then relabel both
         elif left_count > max_cluster_size and right_count > max_cluster_size:
             relabel[left] = parent_node
@@ -263,8 +261,8 @@ def extract_leaves(condensed_tree, allow_single_cluster=True):
     leaf_indicator = np.ones(n_nodes, dtype=np.bool_)
     leaf_indicator[:n_points] = False
 
-    for parent, child_size in zip(condensed_tree.parent, condensed_tree.child_size):
-        if child_size > 1:
+    for parent, child in zip(condensed_tree.parent, condensed_tree.child):
+        if child >= condensed_tree.parent[0]:
             leaf_indicator[parent] = False
 
     return np.nonzero(leaf_indicator)[0]
@@ -292,8 +290,8 @@ def cluster_tree_from_condensed_tree_bcubed(condensed_tree, cluster_tree, label_
     # A labeled node that has no children and who's parent is not a leaf cluster, then it must be 
     # a noisy node (virtual node). 
 
-    mask1 = condensed_tree.child_size > 1
-    mask2 = condensed_tree.child_size == 1
+    mask1 = condensed_tree.child >= condensed_tree.parent[0]
+    mask2 = condensed_tree.child < condensed_tree.parent[0]
     mask3 = np.array([child in label_indices_list for child in condensed_tree.child])
     mask4 = np.array([parent in cluster_tree_parents for parent in condensed_tree.parent]) # check that it's not a leaf cluster
 
@@ -468,7 +466,7 @@ def score_condensed_tree_nodes(condensed_tree):
     result = {root: np.float32(0.0)}
 
     for i in range(condensed_tree.parent.shape[0]):
-        if condensed_tree.child_size[i] > 1:
+        if condensed_tree.child[i] >= condensed_tree.parent[0]:
             child = condensed_tree.child[i]
             result[child] = -condensed_tree.lambda_val[i] * condensed_tree.child_size[i]
 
@@ -480,7 +478,7 @@ def score_condensed_tree_nodes(condensed_tree):
 
 @numba.njit()
 def cluster_tree_from_condensed_tree(condensed_tree):
-    return mask_condensed_tree(condensed_tree, condensed_tree.child_size > 1)
+    return mask_condensed_tree(condensed_tree, condensed_tree.child >= condensed_tree.parent[0])
 
 
 @numba.njit()
@@ -521,19 +519,15 @@ def eom_recursion(node, cluster_tree, node_scores, node_sizes, selected_clusters
 
 @numba.njit()
 def extract_eom_clusters(condensed_tree, cluster_tree, max_cluster_size=np.inf, allow_single_cluster=False):
-    node_scores = score_condensed_tree_nodes(condensed_tree)
-    if len(cluster_tree.parent) > 0:
-        node_sizes = {node: size for node, size in zip(cluster_tree.child, cluster_tree.child_size.astype(np.float32))}
-        node_sizes[cluster_tree.parent.min()] = np.float32(cluster_tree.parent.min() - 1)
-    else:
-        node_sizes = {-1: np.float32(0.0)}
-    selected_clusters = {node: False for node in node_scores}
-
     if len(cluster_tree.parent) == 0:
         return np.zeros(0, dtype=np.int64)
-
-    cluster_tree_root = cluster_tree.parent.min()
-
+    
+    cluster_tree_root = cluster_tree.parent[0]
+    node_scores = score_condensed_tree_nodes(condensed_tree)
+    selected_clusters = {node: False for node in node_scores}
+    node_sizes = {node: size for node, size in zip(cluster_tree.child, cluster_tree.child_size.astype(np.float32))}
+    node_sizes[cluster_tree_root] = np.float32(cluster_tree_root - 1)
+    
     if allow_single_cluster:
         eom_recursion(cluster_tree_root, cluster_tree, node_scores, node_sizes, selected_clusters, max_cluster_size)
     elif len(node_scores) > 1:
@@ -758,7 +752,7 @@ def max_lambdas(tree, clusters):
 
     for n in range(tree.parent.shape[0]):
         cluster = tree.parent[n]
-        if cluster in clusters and tree.child_size[n] == 1:
+        if cluster in clusters and tree.child[n] < tree.parent[0]:
             result[cluster] = max(result[cluster], tree.lambda_val[n])
 
     return result
